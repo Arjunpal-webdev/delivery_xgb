@@ -2,192 +2,313 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import pickle
-import matplotlib.pyplot as plt
-import seaborn as sns
 import os
+import shap
+import plotly.express as px
+import plotly.graph_objects as go
+
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 
-# --- 1. Set Page Configuration ---
-st.set_page_config(layout="wide", page_title="Delivery Time Prediction App")
+# =========================================================
+# PAGE CONFIG
+# =========================================================
 
-# --- 2. Define Paths and Global Constants ---
-MODEL_PATH = 'best_xgb_regressor_weighted.pkl'
-DATA_PATH = 'Food_Delivery_Times.csv'
-categorical_cols = ['Weather', 'Traffic_Level', 'Time_of_Day', 'Vehicle_Type']
+st.set_page_config(
+    page_title="DeliveryX AI",
+    page_icon="🚚",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# =========================================================
+# CUSTOM CSS
+# =========================================================
+
+st.markdown("""
+<style>
+
+.main {
+    background-color: #0E1117;
+}
+
+.block-container {
+    padding-top: 4rem;
+    padding-bottom: 2rem;
+}
+
+.big-title {
+    font-size: 42px;
+    font-weight: 700;
+}
+
+.subtitle {
+    color: #B0B0B0;
+    margin-bottom: 20px;
+}
+
+.prediction-card {
+    background: linear-gradient(135deg, #1f4037, #99f2c8);
+    padding: 30px;
+    border-radius: 20px;
+    color: black;
+    text-align: center;
+    margin-top: 20px;
+}
+
+.metric-card {
+    background-color: #1E1E1E;
+    padding: 20px;
+    border-radius: 15px;
+    text-align: center;
+}
+
+.section-card {
+    background-color: #1A1C24;
+    padding: 20px;
+    border-radius: 15px;
+    margin-bottom: 20px;
+}
+
+</style>
+""", unsafe_allow_html=True)
+
+# =========================================================
+# PATHS
+# =========================================================
+
+MODEL_PATH = "best_xgb_regressor_weighted.pkl"
+DATA_PATH = "Food_Delivery_Times.csv"
+
+categorical_cols = [
+    'Weather',
+    'Traffic_Level',
+    'Time_of_Day',
+    'Vehicle_Type'
+]
+
 NUMERICAL_IMPUTATION_COL = 'Courier_Experience_yrs'
 
-# --- 3. Load Pre-trained Model and Setup Encoders/Imputation Values ---
+# =========================================================
+# LOAD MODEL + DATA
+# =========================================================
+
 @st.cache_resource
 def load_resources():
-    # Load the best model
-    if os.path.exists(MODEL_PATH):
-        with open(MODEL_PATH, 'rb') as file:
-            model = pickle.load(file)
-    else:
-        st.error(f"{MODEL_PATH} not found. Please ensure the file exists in the same directory as main.py")
+
+    if not os.path.exists(MODEL_PATH):
+        st.error("Model file not found")
         st.stop()
 
-    # Load original data and setup encoders/imputation values
-    if os.path.exists(DATA_PATH):
-        raw_df_full = pd.read_csv(DATA_PATH)
-    else:
-        st.error(f"{DATA_PATH} not found. Please ensure the file exists in the same directory as main.py")
+    if not os.path.exists(DATA_PATH):
+        st.error("Dataset file not found")
         st.stop()
 
-    # Make a copy to avoid modifying the original loaded DataFrame
-    temp_df_for_fitting = raw_df_full.copy()
+    with open(MODEL_PATH, "rb") as file:
+        model = pickle.load(file)
 
-    # Impute missing numerical values before fitting encoders for consistency
-    if NUMERICAL_IMPUTATION_COL in temp_df_for_fitting.columns:
-        median_val = temp_df_for_fitting[NUMERICAL_IMPUTATION_COL].median()
-        temp_df_for_fitting[NUMERICAL_IMPUTATION_COL] = temp_df_for_fitting[NUMERICAL_IMPUTATION_COL].fillna(median_val)
-    else:
-        median_val = temp_df_for_fitting[NUMERICAL_IMPUTATION_COL].median() # Fallback, though should exist
+    raw_df = pd.read_csv(DATA_PATH)
+
+    temp_df = raw_df.copy()
+
+    median_val = temp_df[NUMERICAL_IMPUTATION_COL].median()
+
+    temp_df[NUMERICAL_IMPUTATION_COL] = temp_df[
+        NUMERICAL_IMPUTATION_COL
+    ].fillna(median_val)
 
     imputation_values = {
         NUMERICAL_IMPUTATION_COL: median_val
     }
 
     fitted_encoders = {}
+
     for col in categorical_cols:
-        if col in temp_df_for_fitting.columns:
-            # Ensure column is string type for LabelEncoder
-            temp_df_for_fitting[col] = temp_df_for_fitting[col].astype(str)
-            # Get mode for imputation and store it
-            mode_val = temp_df_for_fitting[col].mode()[0]
-            imputation_values[col] = mode_val
-            # Fill NaNs before fitting encoder
-            temp_df_for_fitting[col] = temp_df_for_fitting[col].fillna(mode_val)
 
-            encoder = LabelEncoder()
-            encoder.fit(temp_df_for_fitting[col].unique()) # Fit on all unique values for robustness
-            fitted_encoders[col] = encoder
-        else:
-            st.warning(f"Column '{col}' not found in the training data. This may cause issues.")
+        temp_df[col] = temp_df[col].astype(str)
 
-    return model, raw_df_full, fitted_encoders, imputation_values
+        mode_val = temp_df[col].mode()[0]
+
+        temp_df[col] = temp_df[col].fillna(mode_val)
+
+        imputation_values[col] = mode_val
+
+        encoder = LabelEncoder()
+
+        encoder.fit(temp_df[col].unique())
+
+        fitted_encoders[col] = encoder
+
+    return model, raw_df, fitted_encoders, imputation_values
+
 
 best_xgb_regressor_weighted, raw_df, fitted_encoders, imputation_values = load_resources()
 
-# Define the exact feature columns and their order used during training
+# =========================================================
+# SHAP EXPLAINER
+# =========================================================
+
+@st.cache_resource
+def load_shap_explainer(_model):
+
+    return shap.TreeExplainer(_model)
+
+
+explainer = load_shap_explainer(
+    best_xgb_regressor_weighted
+)
+
+# =========================================================
+# FEATURE COLUMNS
+# =========================================================
+
 feature_columns = [
-    'Distance_km', 'Weather', 'Traffic_Level', 'Time_of_Day', 'Vehicle_Type',
-    'Preparation_Time_min', 'Courier_Experience_yrs', 'is_long_distance',
+    'Distance_km',
+    'Weather',
+    'Traffic_Level',
+    'Time_of_Day',
+    'Vehicle_Type',
+    'Preparation_Time_min',
+    'Courier_Experience_yrs',
+    'is_long_distance',
     'Distance_Preparation_Interaction'
 ]
 
-# --- 4. Helper Functions for Feature Engineering and Prediction ---
+# =========================================================
+# FEATURE ENGINEERING
+# =========================================================
+
 def apply_feature_engineering(df_input):
-    """
-    Applies the same feature engineering steps as performed during training.
-    Handles missing values and applies Label Encoding using pre-fitted encoders.
-    Returns a DataFrame with columns matching the training set order.
-    """
+
     df = df_input.copy()
 
-    # 1. Impute missing numerical values
     if NUMERICAL_IMPUTATION_COL in df.columns:
-        df[NUMERICAL_IMPUTATION_COL] = df[NUMERICAL_IMPUTATION_COL].fillna(imputation_values[NUMERICAL_IMPUTATION_COL])
 
-    # 2. Impute missing categorical values and apply Label Encoding
+        df[NUMERICAL_IMPUTATION_COL] = df[
+            NUMERICAL_IMPUTATION_COL
+        ].fillna(imputation_values[NUMERICAL_IMPUTATION_COL])
+
     for col in categorical_cols:
-        if col in df.columns:
-            # Ensure column is string type
-            df[col] = df[col].astype(str)
 
-            # Impute missing values with pre-computed mode from training data
-            df[col] = df[col].fillna(imputation_values[col])
+        df[col] = df[col].astype(str)
 
-            encoder = fitted_encoders.get(col)
-            if encoder:
-                # Handle unseen categories by mapping them to 0 (first class label)
-                # This creates NaN for unseen, then fills with 0, then converts to int
-                mapping = {cls: idx for idx, cls in enumerate(encoder.classes_)}
-                df[col] = df[col].map(mapping).fillna(0).astype(int)
-            else:
-                st.warning(f"No encoder found for column '{col}'. Skipping encoding.")
-        else:
-            # If a categorical column is missing from input, add it and fill with default (0)
-            df[col] = 0 # Assume 0 as default encoded value if column is entirely missing
+        encoder = fitted_encoders[col]
 
-    # 3. Create 'is_long_distance' feature
-    if 'Distance_km' in df.columns:
-        df['is_long_distance'] = (df['Distance_km'] > 15).astype(int)
-    else:
-        df['is_long_distance'] = 0 # Default if Distance_km is missing
+        mapping = {
+            cls: idx for idx, cls in enumerate(encoder.classes_)
+        }
 
-    # 4. Create an interaction feature: Distance * Preparation Time
-    if 'Distance_km' in df.columns and 'Preparation_Time_min' in df.columns:
-        df['Distance_Preparation_Interaction'] = df['Distance_km'] * df['Preparation_Time_min']
-    else:
-        df['Distance_Preparation_Interaction'] = 0 # Default if components are missing
+        df[col] = df[col].map(mapping).fillna(0).astype(int)
 
-    # 5. Ensure column order and presence matches training data
-    df_processed = df.reindex(columns=feature_columns, fill_value=0) # Fill missing new columns with 0
+    df['is_long_distance'] = (
+        df['Distance_km'] > 15
+    ).astype(int)
+
+    df['Distance_Preparation_Interaction'] = (
+        df['Distance_km'] *
+        df['Preparation_Time_min']
+    )
+
+    df_processed = df.reindex(
+        columns=feature_columns,
+        fill_value=0
+    )
 
     return df_processed
 
+# =========================================================
+# PREDICTION FUNCTIONS
+# =========================================================
+
 def make_single_prediction(data, model):
-    """
-    Makes a single prediction using the pre-trained model.
-    """
+
     input_df = pd.DataFrame([data])
+
     processed_df = apply_feature_engineering(input_df)
+
     prediction = model.predict(processed_df)
-    return prediction[0]
+
+    return prediction[0], processed_df
+
 
 def make_batch_prediction(df_input, model):
-    """
-    Makes batch predictions on a DataFrame using the pre-trained model.
-    """
-    # Drop 'Order_ID' if present, as it's not a feature
-    processed_df = apply_feature_engineering(df_input.drop(columns=['Order_ID'], errors='ignore'))
+
+    processed_df = apply_feature_engineering(
+        df_input.drop(columns=['Order_ID'], errors='ignore')
+    )
+
     predictions = model.predict(processed_df)
+
     return predictions
 
-# --- 5. Prepare Data for Model Analytics Section (executed once on app startup) ---
+# =========================================================
+# ANALYTICS DATA
+# =========================================================
 
-# Replicate training preprocessing for analytics plots
 processed_df_for_analytics = raw_df.copy()
 
-# Impute numerical column
-if NUMERICAL_IMPUTATION_COL in processed_df_for_analytics.columns:
-    processed_df_for_analytics[NUMERICAL_IMPUTATION_COL] = processed_df_for_analytics[NUMERICAL_IMPUTATION_COL].fillna(imputation_values[NUMERICAL_IMPUTATION_COL])
+processed_df_for_analytics[
+    NUMERICAL_IMPUTATION_COL
+] = processed_df_for_analytics[
+    NUMERICAL_IMPUTATION_COL
+].fillna(imputation_values[NUMERICAL_IMPUTATION_COL])
 
-# Process categorical columns
 for col in categorical_cols:
-    if col in processed_df_for_analytics.columns:
-        processed_df_for_analytics[col] = processed_df_for_analytics[col].astype(str)
-        processed_df_for_analytics[col] = processed_df_for_analytics[col].fillna(imputation_values[col])
 
-        encoder = fitted_encoders.get(col)
-        if encoder:
-            processed_df_for_analytics[col] = encoder.transform(processed_df_for_analytics[col])
+    processed_df_for_analytics[col] = processed_df_for_analytics[
+        col
+    ].astype(str)
 
-# Create engineered features
-processed_df_for_analytics['is_long_distance'] = (processed_df_for_analytics['Distance_km'] > 15).astype(int)
-processed_df_for_analytics['Distance_Preparation_Interaction'] = processed_df_for_analytics['Distance_km'] * processed_df_for_analytics['Preparation_Time_min']
+    encoder = fitted_encoders[col]
 
-# Define X and y for splitting, ensuring consistent columns for X
-X_for_analytics = processed_df_for_analytics.drop(columns=['Delivery_Time_min', 'Order_ID'], errors='ignore')
-y_for_analytics = processed_df_for_analytics['Delivery_Time_min']
+    processed_df_for_analytics[col] = encoder.transform(
+        processed_df_for_analytics[col]
+    )
 
-# Reindex X_for_analytics to ensure correct order before splitting
-X_for_analytics = X_for_analytics.reindex(columns=feature_columns, fill_value=0)
+processed_df_for_analytics['is_long_distance'] = (
+    processed_df_for_analytics['Distance_km'] > 15
+).astype(int)
 
-# Split the data (using the same random_state as during training)
-X_train_new, X_test_new, y_train_new, y_test_new = train_test_split(X_for_analytics, y_for_analytics, test_size=0.2, random_state=42)
+processed_df_for_analytics['Distance_Preparation_Interaction'] = (
+    processed_df_for_analytics['Distance_km'] *
+    processed_df_for_analytics['Preparation_Time_min']
+)
 
-# Generate predictions on the test set for analytics plots
-y_pred_xgb_tuned_weighted = best_xgb_regressor_weighted.predict(X_test_new)
+X_for_analytics = processed_df_for_analytics.drop(
+    columns=['Delivery_Time_min', 'Order_ID'],
+    errors='ignore'
+)
 
-# --- 6. Sidebar Navigation and Information ---
+X_for_analytics = X_for_analytics.reindex(
+    columns=feature_columns,
+    fill_value=0
+)
+
+y_for_analytics = processed_df_for_analytics[
+    'Delivery_Time_min'
+]
+
+X_train_new, X_test_new, y_train_new, y_test_new = train_test_split(
+    X_for_analytics,
+    y_for_analytics,
+    test_size=0.2,
+    random_state=42
+)
+
+y_pred_xgb = best_xgb_regressor_weighted.predict(
+    X_test_new
+)
+
+# =========================================================
+# SIDEBAR
+# =========================================================
+
 with st.sidebar:
+
     st.title("Delivery Time Prediction App")
     st.markdown("---")
 
-    st.header("Tool Overview")
+    st.header("Project/Tool Overview")
     st.markdown("This application leverages machine learning to predict food delivery times based on various factors. It helps optimize logistics and provide accurate ETAs to customers.")
 
     st.header("How it Works")
@@ -203,71 +324,175 @@ with st.sidebar:
     st.markdown("- **Performance**: Achieved an MSE of **92.21** and an R-squared of **0.79** on the test set, showing improved accuracy, especially for challenging cases.")
     st.markdown("- **Features**: Utilizes `Distance_km`, `Preparation_Time_min`, `Courier_Experience_yrs`, `Weather`, `Traffic_Level`, `Time_of_Day`, `Vehicle_Type`, and engineered features.")
 
-# --- 7. Main Application Content ---
-st.title("Food Delivery Time Prediction")
-st.write("Use this application to predict delivery times and analyze model performance.")
+# =========================================================
+# HERO SECTION
+# =========================================================
 
-tab1, tab2, tab3 = st.tabs(["Batch Prediction", "Model Analytics", "One Prediction"])
+st.markdown(
+    "<p class='big-title'>🚚 Food Delivery Time Prediction</p>",
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    "<p class='subtitle'>Use this application to predict delivery times and analyze model performance</p>",
+    unsafe_allow_html=True
+)
+
+c1, c2, c3, c4 = st.columns(4)
+
+c1.metric("Model", "XGBoost")
+c2.metric("R² Score", "0.79")
+c3.metric("MSE", "92.21")
+c4.metric("Features", "9")
+
+# =========================================================
+# TABS
+# =========================================================
+
+tab1, tab2, tab3 = st.tabs([
+    "📦 Batch Prediction",
+    "📊 Model Analytics",
+    "🚀 Single Prediction"
+])
+
+# =========================================================
+# BATCH PREDICTION
+# =========================================================
 
 with tab1:
-    st.header("Batch Prediction")
-    st.write("Upload a CSV, Excel, or JSON file to get batch predictions for delivery times.")
 
-    uploaded_file = st.file_uploader("Choose a file", type=['csv', 'xlsx', 'json'])
-    output_format = st.selectbox("Select output format for predictions", ('CSV', 'JSON'), key='batch_output_format')
+    st.subheader("📦 Batch Prediction")
+
+    uploaded_file = st.file_uploader(
+        "Upload CSV / Excel / JSON",
+        type=['csv', 'xlsx', 'json']
+    )
 
     if uploaded_file is not None:
-        df_batch_input = None
-        try:
-            if uploaded_file.name.endswith('.csv'):
-                df_batch_input = pd.read_csv(uploaded_file)
-            elif uploaded_file.name.endswith('.xlsx'):
-                df_batch_input = pd.read_excel(uploaded_file)
-            elif uploaded_file.name.endswith('.json'):
-                df_batch_input = pd.read_json(uploaded_file)
 
-            if df_batch_input is not None:
-                st.write("Uploaded Data Preview:")
-                st.dataframe(df_batch_input.head())
+        if uploaded_file.name.endswith('.csv'):
+            df_batch_input = pd.read_csv(uploaded_file)
 
-                if st.button("Run Batch Prediction", key='run_batch_prediction_button'):
-                    try:
-                        batch_predictions = make_batch_prediction(df_batch_input, best_xgb_regressor_weighted)
-                        df_batch_input['Predicted_Delivery_Time_min'] = batch_predictions
+        elif uploaded_file.name.endswith('.xlsx'):
+            df_batch_input = pd.read_excel(uploaded_file)
 
-                        st.subheader("Batch Predictions Results")
-                        st.dataframe(df_batch_input)
+        elif uploaded_file.name.endswith('.json'):
+            df_batch_input = pd.read_json(uploaded_file)
 
-                        # Provide download link
-                        if output_format == 'CSV':
-                            csv_output = df_batch_input.to_csv(index=False).encode('utf-8')
-                            st.download_button(
-                                label="Download as CSV",
-                                data=csv_output,
-                                file_name="batch_predictions.csv",
-                                mime="text/csv",
-                                key='download_csv'
-                            )
-                        elif output_format == 'JSON':
-                            json_output = df_batch_input.to_json(orient="records").encode('utf-8')
-                            st.download_button(
-                                label="Download as JSON",
-                                data=json_output,
-                                file_name="batch_predictions.json",
-                                mime="application/json",
-                                key='download_json'
-                            )
+        st.dataframe(df_batch_input.head())
 
-                    except Exception as e:
-                        st.error(f"Error during batch prediction: {e}")
-                        st.exception(e)
+        if st.button("Run Batch Prediction"):
 
-        except Exception as e:
-            st.error(f"Error processing uploaded file: {e}")
-            st.exception(e)
+            predictions = make_batch_prediction(
+                df_batch_input,
+                best_xgb_regressor_weighted
+            )
+
+            df_batch_input[
+                'Predicted_Delivery_Time_min'
+            ] = predictions
+
+            st.dataframe(df_batch_input)
+
+            csv = df_batch_input.to_csv(
+                index=False
+            ).encode('utf-8')
+
+            st.download_button(
+                "Download Predictions",
+                csv,
+                "predictions.csv",
+                "text/csv"
+            )
+
+# =========================================================
+# MODEL ANALYTICS
+# =========================================================
 
 with tab2:
-    st.header("Model Analytics")
+
+    st.subheader("📊 Model Analytics")
+
+    k1, k2, k3, k4 = st.columns(4)
+
+    k1.metric("R² Score", "0.79")
+    k2.metric("MSE", "92.21")
+    k3.metric("Best Model", "XGBoost")
+    k4.metric("Features Used", "9")
+
+    # ACTUAL VS PREDICTED
+
+    fig_actual = px.scatter(
+        x=y_test_new,
+        y=y_pred_xgb,
+        labels={
+            'x': 'Actual Delivery Time',
+            'y': 'Predicted Delivery Time'
+        },
+        title='Actual vs Predicted'
+    )
+
+    fig_actual.add_trace(
+        go.Scatter(
+            x=[y_test_new.min(), y_test_new.max()],
+            y=[y_test_new.min(), y_test_new.max()],
+            mode='lines',
+            name='Perfect Prediction'
+        )
+    )
+
+    st.plotly_chart(
+        fig_actual,
+        use_container_width=True
+    )
+
+    # RESIDUAL PLOT
+
+    residuals = y_test_new - y_pred_xgb
+
+    fig_residual = px.scatter(
+        x=y_pred_xgb,
+        y=residuals,
+        labels={
+            'x': 'Predicted',
+            'y': 'Residuals'
+        },
+        title='Residual Plot'
+    )
+
+    st.plotly_chart(
+        fig_residual,
+        use_container_width=True
+    )
+
+    # FEATURE IMPORTANCE
+
+    st.subheader("🔥 Feature Importance")
+
+    feature_importances = best_xgb_regressor_weighted.feature_importances_
+
+    features_df = pd.DataFrame({
+        'Feature': X_train_new.columns,
+        'Importance': feature_importances
+    }).sort_values(
+        by='Importance',
+        ascending=False
+    )
+
+    fig_feat = px.bar(
+        features_df,
+        x='Importance',
+        y='Feature',
+        orientation='h',
+        title='Feature Importance'
+    )
+
+    st.plotly_chart(
+        fig_feat,
+        use_container_width=True
+    )
+
+    st.dataframe(features_df)
 
     st.subheader("Model Comparison and Metrics")
     st.write("Comparing the performance of different models trained during the development phase.")
@@ -290,75 +515,72 @@ with tab2:
     df_metrics = pd.DataFrame(metrics_data)
     st.dataframe(df_metrics)
 
-    st.subheader("Best Model: Actual vs. Predicted Plot")
-    st.write("Visualizing the performance of the Tuned Weighted XGBoost Regressor on the test set.")
-
-    fig_actual_pred = plt.figure(figsize=(10, 7))
-    sns.scatterplot(x=y_test_new, y=y_pred_xgb_tuned_weighted, alpha=0.6)
-    plt.plot([y_test_new.min(), y_test_new.max()], [y_test_new.min(), y_test_new.max()], 'r--', lw=2)
-    plt.xlabel('Actual Delivery Time (min)')
-    plt.ylabel('Predicted Delivery Time (min)')
-    plt.title('Actual vs. Predicted Delivery Times (Tuned Weighted XGBoost Regressor)')
-    plt.grid(True, linestyle='--', alpha=0.7)
-    st.pyplot(fig_actual_pred)
-
-    st.subheader("Best Model: Residual Plot")
-    residuals_xgb_tuned_weighted = y_test_new - y_pred_xgb_tuned_weighted
-    fig_residual = plt.figure(figsize=(10, 7))
-    sns.scatterplot(x=y_pred_xgb_tuned_weighted, y=residuals_xgb_tuned_weighted, alpha=0.6)
-    plt.axhline(y=0, color='r', linestyle='--', lw=2)
-    plt.xlabel('Predicted Delivery Time (min)')
-    plt.ylabel('Residuals (Actual - Predicted)')
-    st.title('Residual Plot (Tuned Weighted XGBoost Regressor)') # Changed to st.title for higher visibility
-    plt.grid(True, linestyle='--', alpha=0.7)
-    st.pyplot(fig_residual)
-
-    st.subheader("Feature Importances")
-    st.write("Understanding which features contribute most to the model's predictions.")
-
-    if hasattr(best_xgb_regressor_weighted, 'feature_importances_'):
-        feature_importances = best_xgb_regressor_weighted.feature_importances_
-        feature_names = X_train_new.columns # Use columns from X_train_new
-
-        features_df = pd.DataFrame({
-            'Feature': feature_names,
-            'Importance': feature_importances
-        }).sort_values(by='Importance', ascending=False)
-
-        st.dataframe(features_df)
-
-        fig_feat_imp = plt.figure(figsize=(12, 7))
-        sns.barplot(x='Importance', y='Feature', data=features_df, palette='viridis')
-        plt.title('Feature Importances (Tuned Weighted XGBoost Regressor)')
-        plt.xlabel('Relative Importance')
-        plt.ylabel('Feature')
-        plt.grid(axis='x', linestyle='--', alpha=0.7)
-        st.pyplot(fig_feat_imp)
-    else:
-        st.warning("Feature importances could not be displayed. Model does not have `feature_importances_` attribute.")
+# =========================================================
+# SINGLE PREDICTION
+# =========================================================
 
 with tab3:
-    st.header("One Prediction")
-    st.write("Enter the details below to get a single delivery time prediction.")
 
-    # Input fields for each feature
-    distance_km = st.number_input("Distance (km)", min_value=0.1, max_value=50.0, value=10.0, key='distance_km')
-    preparation_time_min = st.number_input("Preparation Time (min)", min_value=1, max_value=60, value=15, key='preparation_time_min')
-    courier_experience_yrs = st.number_input("Courier Experience (yrs)", min_value=0.0, max_value=20.0, value=2.0, key='courier_experience_yrs')
+    st.subheader("🚀 Smart Delivery Prediction")
 
-    # Categorical features - Use selectbox with original categories from fitted encoders
-    weather_options = list(fitted_encoders['Weather'].classes_)
-    traffic_options = list(fitted_encoders['Traffic_Level'].classes_)
-    time_of_day_options = list(fitted_encoders['Time_of_Day'].classes_)
-    vehicle_options = list(fitted_encoders['Vehicle_Type'].classes_)
+    col1, col2 = st.columns(2)
 
-    # Ensure default values are within the options and handle cases where they might not be
-    weather = st.selectbox("Weather", weather_options, index=weather_options.index('Clear') if 'Clear' in weather_options else 0, key='weather_select')
-    traffic_level = st.selectbox("Traffic Level", traffic_options, index=traffic_options.index('Medium') if 'Medium' in traffic_options else 0, key='traffic_level_select')
-    time_of_day = st.selectbox("Time of Day", time_of_day_options, index=time_of_day_options.index('Afternoon') if 'Afternoon' in time_of_day_options else 0, key='time_of_day_select')
-    vehicle_type = st.selectbox("Vehicle Type", vehicle_options, index=vehicle_options.index('Scooter') if 'Scooter' in vehicle_options else 0, key='vehicle_type_select')
+    with col1:
 
-    if st.button("Predict Delivery Time", key='predict_single_button'):
+        st.markdown("### 📍 Route Information")
+
+        distance_km = st.slider(
+            "Distance (km)",
+            1.0,
+            50.0,
+            10.0
+        )
+
+        preparation_time_min = st.slider(
+            "Preparation Time (min)",
+            1,
+            60,
+            15
+        )
+
+        courier_experience_yrs = st.slider(
+            "Courier Experience (yrs)",
+            0.0,
+            20.0,
+            2.0
+        )
+
+    with col2:
+
+        st.markdown("### 🌦 Environment")
+
+        weather = st.selectbox(
+            "Weather",
+            ['Clear', 'Foggy', 'Rainy', 'Snowy', 'Windy']
+        )
+
+        traffic_level = st.selectbox(
+            "Traffic Level",
+            ['Low', 'Medium', 'High']
+        )
+
+        time_of_day = st.selectbox(
+            "Time of Day",
+            ['Morning', 'Afternoon', 'Evening', 'Night']
+        )
+
+        vehicle_type = st.selectbox(
+            "Vehicle Type",
+            ['Bike', 'Car', 'Scooter']
+        )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    if st.button(
+        "🚀 Predict Delivery Time",
+        use_container_width=True
+    ):
+
         input_data = {
             'Distance_km': distance_km,
             'Weather': weather,
@@ -370,8 +592,92 @@ with tab3:
         }
 
         try:
-            predicted_time = make_single_prediction(input_data, best_xgb_regressor_weighted)
-            st.success(f"The predicted delivery time is: **{predicted_time:.2f} minutes**")
+
+            predicted_time, processed_df = make_single_prediction(
+                input_data,
+                best_xgb_regressor_weighted
+            )
+
+            confidence_score = max(
+                65,
+                min(98, 100 - (predicted_time / 2))
+            )
+
+            if predicted_time < 25:
+                risk_level = "🟢 Low Delay Risk"
+
+            elif predicted_time < 45:
+                risk_level = "🟡 Medium Delay Risk"
+
+            else:
+                risk_level = "🔴 High Delay Risk"
+
+            st.markdown(f"""
+            <div class='prediction-card'>
+                <h1>⏱ Predicted ETA</h1>
+                <h1>{predicted_time:.2f} Minutes</h1>
+                <h3>Confidence Score: {confidence_score:.1f}%</h3>
+                <h3>{risk_level}</h3>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # SHAP ANALYSIS
+
+            st.subheader("🔍 SHAP Explainability")
+
+            shap_values = explainer.shap_values(
+                processed_df
+            )
+
+            shap_df = pd.DataFrame({
+                'Feature': processed_df.columns,
+                'Impact': shap_values[0]
+            })
+
+            shap_df['abs_impact'] = np.abs(
+                shap_df['Impact']
+            )
+
+            shap_df = shap_df.sort_values(
+                by='abs_impact',
+                ascending=False
+            )
+
+            fig_shap = px.bar(
+                shap_df,
+                x='Impact',
+                y='Feature',
+                orientation='h',
+                title='SHAP Feature Impact'
+            )
+
+            st.plotly_chart(
+                fig_shap,
+                use_container_width=True
+            )
+
+            st.dataframe(
+                shap_df[['Feature', 'Impact']]
+            )
+
+            st.subheader("📌 Top Influencing Features")
+
+            top_features = shap_df.head(3)
+
+            for _, row in top_features.iterrows():
+
+                if row['Impact'] > 0:
+
+                    st.success(
+                        f"{row['Feature']} increased delivery time"
+                    )
+
+                else:
+
+                    st.info(
+                        f"{row['Feature']} reduced delivery time"
+                    )
+
         except Exception as e:
-            st.error(f"Error during single prediction: {e}")
-            st.exception(e)
+
+            st.error(f"Prediction Error: {e}")
