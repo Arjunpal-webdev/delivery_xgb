@@ -1,17 +1,14 @@
-import os
+from pathlib import Path
 
 # =========================================================
 # PATHS
 # =========================================================
 
-# Project root = two levels up from this file (utils/constants.py)
-_PROJECT_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..")
-)
+BASE_DIR = Path(__file__).resolve().parent.parent
 
-MODEL_PATH = os.path.join(_PROJECT_ROOT, "models", "best_xgb_regressor_weighted.pkl")
-ENCODER_PATH = os.path.join(_PROJECT_ROOT, "models", "label_encoder.pkl")
-DATA_PATH = os.path.join(_PROJECT_ROOT, "data", "Food_Delivery_Times.csv")
+MODEL_PATH = BASE_DIR / "models" / "best_xgb_regressor_weighted.pkl"
+ENCODER_PATH = BASE_DIR / "models" / "label_encoder.pkl"
+DATA_PATH = BASE_DIR / "data" / "Food_Delivery_Times.csv"
 
 # =========================================================
 # FEATURE DEFINITIONS
