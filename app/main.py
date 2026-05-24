@@ -1,14 +1,26 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import pickle
+import sys
 import os
-import shap
+
+# Ensure the project root is on sys.path so all imports resolve
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import numpy as np
+import pandas as pd
+import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 
-from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split
+from utils.styles import inject_css
+from utils.constants import metrics_data
+from utils.helpers import calculate_confidence_score, calculate_risk_level
+
+from services.model_loader import load_resources
+from services.prediction_service import (
+    make_single_prediction,
+    make_batch_prediction,
+    load_shap_explainer,
+)
+from services.analytics_service import prepare_analytics_data
 
 # =========================================================
 # PAGE CONFIG
@@ -25,122 +37,11 @@ st.set_page_config(
 # CUSTOM CSS
 # =========================================================
 
-st.markdown("""
-<style>
-
-.main {
-    background-color: #0E1117;
-}
-
-.block-container {
-    padding-top: 4rem;
-    padding-bottom: 2rem;
-}
-
-.big-title {
-    font-size: 42px;
-    font-weight: 700;
-}
-
-.subtitle {
-    color: #B0B0B0;
-    margin-bottom: 20px;
-}
-
-.prediction-card {
-    background: linear-gradient(135deg, #1f4037, #99f2c8);
-    padding: 30px;
-    border-radius: 20px;
-    color: black;
-    text-align: center;
-    margin-top: 20px;
-}
-
-.metric-card {
-    background-color: #1E1E1E;
-    padding: 20px;
-    border-radius: 15px;
-    text-align: center;
-}
-
-.section-card {
-    background-color: #1A1C24;
-    padding: 20px;
-    border-radius: 15px;
-    margin-bottom: 20px;
-}
-
-</style>
-""", unsafe_allow_html=True)
-
-# =========================================================
-# PATHS
-# =========================================================
-
-MODEL_PATH = "best_xgb_regressor_weighted.pkl"
-DATA_PATH = "Food_Delivery_Times.csv"
-
-categorical_cols = [
-    'Weather',
-    'Traffic_Level',
-    'Time_of_Day',
-    'Vehicle_Type'
-]
-
-NUMERICAL_IMPUTATION_COL = 'Courier_Experience_yrs'
+inject_css()
 
 # =========================================================
 # LOAD MODEL + DATA
 # =========================================================
-
-@st.cache_resource
-def load_resources():
-
-    if not os.path.exists(MODEL_PATH):
-        st.error("Model file not found")
-        st.stop()
-
-    if not os.path.exists(DATA_PATH):
-        st.error("Dataset file not found")
-        st.stop()
-
-    with open(MODEL_PATH, "rb") as file:
-        model = pickle.load(file)
-
-    raw_df = pd.read_csv(DATA_PATH)
-
-    temp_df = raw_df.copy()
-
-    median_val = temp_df[NUMERICAL_IMPUTATION_COL].median()
-
-    temp_df[NUMERICAL_IMPUTATION_COL] = temp_df[
-        NUMERICAL_IMPUTATION_COL
-    ].fillna(median_val)
-
-    imputation_values = {
-        NUMERICAL_IMPUTATION_COL: median_val
-    }
-
-    fitted_encoders = {}
-
-    for col in categorical_cols:
-
-        temp_df[col] = temp_df[col].astype(str)
-
-        mode_val = temp_df[col].mode()[0]
-
-        temp_df[col] = temp_df[col].fillna(mode_val)
-
-        imputation_values[col] = mode_val
-
-        encoder = LabelEncoder()
-
-        encoder.fit(temp_df[col].unique())
-
-        fitted_encoders[col] = encoder
-
-    return model, raw_df, fitted_encoders, imputation_values
-
 
 best_xgb_regressor_weighted, raw_df, fitted_encoders, imputation_values = load_resources()
 
@@ -148,155 +49,17 @@ best_xgb_regressor_weighted, raw_df, fitted_encoders, imputation_values = load_r
 # SHAP EXPLAINER
 # =========================================================
 
-@st.cache_resource
-def load_shap_explainer(_model):
-
-    return shap.TreeExplainer(_model)
-
-
-explainer = load_shap_explainer(
-    best_xgb_regressor_weighted
-)
-
-# =========================================================
-# FEATURE COLUMNS
-# =========================================================
-
-feature_columns = [
-    'Distance_km',
-    'Weather',
-    'Traffic_Level',
-    'Time_of_Day',
-    'Vehicle_Type',
-    'Preparation_Time_min',
-    'Courier_Experience_yrs',
-    'is_long_distance',
-    'Distance_Preparation_Interaction'
-]
-
-# =========================================================
-# FEATURE ENGINEERING
-# =========================================================
-
-def apply_feature_engineering(df_input):
-
-    df = df_input.copy()
-
-    if NUMERICAL_IMPUTATION_COL in df.columns:
-
-        df[NUMERICAL_IMPUTATION_COL] = df[
-            NUMERICAL_IMPUTATION_COL
-        ].fillna(imputation_values[NUMERICAL_IMPUTATION_COL])
-
-    for col in categorical_cols:
-
-        df[col] = df[col].astype(str)
-
-        encoder = fitted_encoders[col]
-
-        mapping = {
-            cls: idx for idx, cls in enumerate(encoder.classes_)
-        }
-
-        df[col] = df[col].map(mapping).fillna(0).astype(int)
-
-    df['is_long_distance'] = (
-        df['Distance_km'] > 15
-    ).astype(int)
-
-    df['Distance_Preparation_Interaction'] = (
-        df['Distance_km'] *
-        df['Preparation_Time_min']
-    )
-
-    df_processed = df.reindex(
-        columns=feature_columns,
-        fill_value=0
-    )
-
-    return df_processed
-
-# =========================================================
-# PREDICTION FUNCTIONS
-# =========================================================
-
-def make_single_prediction(data, model):
-
-    input_df = pd.DataFrame([data])
-
-    processed_df = apply_feature_engineering(input_df)
-
-    prediction = model.predict(processed_df)
-
-    return prediction[0], processed_df
-
-
-def make_batch_prediction(df_input, model):
-
-    processed_df = apply_feature_engineering(
-        df_input.drop(columns=['Order_ID'], errors='ignore')
-    )
-
-    predictions = model.predict(processed_df)
-
-    return predictions
+explainer = load_shap_explainer(best_xgb_regressor_weighted)
 
 # =========================================================
 # ANALYTICS DATA
 # =========================================================
 
-processed_df_for_analytics = raw_df.copy()
-
-processed_df_for_analytics[
-    NUMERICAL_IMPUTATION_COL
-] = processed_df_for_analytics[
-    NUMERICAL_IMPUTATION_COL
-].fillna(imputation_values[NUMERICAL_IMPUTATION_COL])
-
-for col in categorical_cols:
-
-    processed_df_for_analytics[col] = processed_df_for_analytics[
-        col
-    ].astype(str)
-
-    encoder = fitted_encoders[col]
-
-    processed_df_for_analytics[col] = encoder.transform(
-        processed_df_for_analytics[col]
-    )
-
-processed_df_for_analytics['is_long_distance'] = (
-    processed_df_for_analytics['Distance_km'] > 15
-).astype(int)
-
-processed_df_for_analytics['Distance_Preparation_Interaction'] = (
-    processed_df_for_analytics['Distance_km'] *
-    processed_df_for_analytics['Preparation_Time_min']
-)
-
-X_for_analytics = processed_df_for_analytics.drop(
-    columns=['Delivery_Time_min', 'Order_ID'],
-    errors='ignore'
-)
-
-X_for_analytics = X_for_analytics.reindex(
-    columns=feature_columns,
-    fill_value=0
-)
-
-y_for_analytics = processed_df_for_analytics[
-    'Delivery_Time_min'
-]
-
-X_train_new, X_test_new, y_train_new, y_test_new = train_test_split(
-    X_for_analytics,
-    y_for_analytics,
-    test_size=0.2,
-    random_state=42
-)
-
-y_pred_xgb = best_xgb_regressor_weighted.predict(
-    X_test_new
+X_train_new, X_test_new, y_train_new, y_test_new, y_pred_xgb = prepare_analytics_data(
+    raw_df,
+    best_xgb_regressor_weighted,
+    fitted_encoders,
+    imputation_values
 )
 
 # =========================================================
@@ -385,7 +148,9 @@ with tab1:
 
             predictions = make_batch_prediction(
                 df_batch_input,
-                best_xgb_regressor_weighted
+                best_xgb_regressor_weighted,
+                fitted_encoders,
+                imputation_values
             )
 
             df_batch_input[
@@ -497,21 +262,6 @@ with tab2:
     st.subheader("Model Comparison and Metrics")
     st.write("Comparing the performance of different models trained during the development phase.")
 
-    metrics_data = {
-        'Model': [
-            'Bagging Regressor (Base)', 'Tuned Bagging Regressor',
-            'Random Forest Regressor (Base)', 'Tuned Random Forest Regressor (without new features)',
-            'Tuned Random Forest Regressor (with new features, old hyperparams)',
-            'Newly Tuned Random Forest Regressor (with new features)',
-            'XGBoost Regressor (Base)', 'XGBoost Regressor (Weighted)', 'Tuned Weighted XGBoost Regressor'
-        ],
-        'MSE': [
-            124.87, 126.53, 100.12, 97.41, 96.53, 98.12, 96.14, 94.94, 92.21
-        ],
-        'R2 Score': [
-            0.72, 0.72, 0.78, 0.78, 0.78, 0.78, 0.79, 0.79, 0.79
-        ]
-    }
     df_metrics = pd.DataFrame(metrics_data)
     st.dataframe(df_metrics)
 
@@ -595,22 +345,13 @@ with tab3:
 
             predicted_time, processed_df = make_single_prediction(
                 input_data,
-                best_xgb_regressor_weighted
+                best_xgb_regressor_weighted,
+                fitted_encoders,
+                imputation_values
             )
 
-            confidence_score = max(
-                65,
-                min(98, 100 - (predicted_time / 2))
-            )
-
-            if predicted_time < 25:
-                risk_level = "🟢 Low Delay Risk"
-
-            elif predicted_time < 45:
-                risk_level = "🟡 Medium Delay Risk"
-
-            else:
-                risk_level = "🔴 High Delay Risk"
+            confidence_score = calculate_confidence_score(predicted_time)
+            risk_level = calculate_risk_level(predicted_time)
 
             st.markdown(f"""
             <div class='prediction-card'>
